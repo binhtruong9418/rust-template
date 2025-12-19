@@ -35,20 +35,13 @@ impl RedisConfig {
     pub fn create_pool(&self) -> Result<Pool, RedisError> {
         let redis_url = self.build_redis_url();
 
-        let cfg = Config {
-            url: Some(redis_url),
-            pool: Some(deadpool_redis::PoolConfig {
-                max_size: self.pool_size,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let cfg = Config::from_url(&redis_url);
 
         cfg.create_pool(Some(Runtime::Tokio1))
             .map_err(|e| RedisError::from((redis::ErrorKind::IoError, "Failed to create pool", e.to_string())))
     }
 
-    fn build_redis_url(&self) -> String {
+    pub fn build_redis_url(&self) -> String {
         let auth = match (&self.username, &self.password) {
             (Some(user), Some(pass)) => format!("{}:{}@", user, pass),
             (None, Some(pass)) => format!(":{}@", pass),

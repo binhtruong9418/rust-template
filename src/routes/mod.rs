@@ -3,13 +3,13 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
-use sqlx::PgPool;
 
+use crate::config::AppState;
 use crate::handlers::{delete_user, get_user, health_check, login, register, update_user};
 use crate::middleware::JwtMiddleware;
 
 /// Create API router
-pub fn create_router(pool: PgPool) -> Router {
+pub fn create_router(state: AppState) -> Router {
     // Health check route (outside /api)
     let health_routes = Router::new()
         .route("/health", get(health_check));
@@ -33,5 +33,5 @@ pub fn create_router(pool: PgPool) -> Router {
             .merge(public_routes)
             .merge(protected_routes)
         )
-        .with_state(pool)
+        .with_state(state)
 }

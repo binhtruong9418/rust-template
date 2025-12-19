@@ -48,6 +48,9 @@ pub enum AppError {
 
     #[error("Queue error: {0}")]
     QueueError(String),
+
+    #[error("Email error: {0}")]
+    EmailError(String),
 }
 
 /// Error codes for API responses
@@ -66,6 +69,7 @@ pub enum ErrorCode {
     JwtError,
     MqttError,
     QueueError,
+    EmailError,
 }
 
 impl ErrorCode {
@@ -84,6 +88,7 @@ impl ErrorCode {
             ErrorCode::JwtError => "JWT_ERROR",
             ErrorCode::MqttError => "MQTT_ERROR",
             ErrorCode::QueueError => "QUEUE_ERROR",
+            ErrorCode::EmailError => "EMAIL_ERROR",
         }
     }
 }
@@ -104,6 +109,7 @@ impl AppError {
             AppError::JwtError(_) => ErrorCode::JwtError,
             AppError::MqttError(_) => ErrorCode::MqttError,
             AppError::QueueError(_) => ErrorCode::QueueError,
+            AppError::EmailError(_) => ErrorCode::EmailError,
         }
     }
 
@@ -122,6 +128,7 @@ impl AppError {
             AppError::JwtError(_) => StatusCode::UNAUTHORIZED,
             AppError::MqttError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::QueueError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::EmailError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 

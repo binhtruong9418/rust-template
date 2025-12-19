@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::RedisConfig;
 use crate::interceptors::AppError;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RedisService {
     pool: Pool,
 }

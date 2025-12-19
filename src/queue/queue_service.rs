@@ -93,8 +93,6 @@ impl QueueManager {
         QUEUE_MANAGER
             .set(manager)
             .map_err(|_| AppError::RedisError("Queue manager already initialized".to_string()))?;
-
-        tracing::info!("✅ Queue manager initialized");
         Ok(())
     }
 
@@ -105,7 +103,7 @@ impl QueueManager {
             .expect("Queue manager not initialized. Call QueueManager::init() first")
     }
 
-    /// Create a queue service instance
+    /// Create a queue service instance (Legacy method)
     pub fn create_queue(&self, name: &str, max_retries: u32) -> QueueService {
         let queue_name = format!("{}_{}_queue", self.config.environment, name);
 
@@ -114,6 +112,32 @@ impl QueueManager {
             max_retries,
             manager: self.clone(),
         }
+    }
+
+    /// Create a queue service instance with processor function (Optimized)
+    pub fn create_queue_with_processor<T, F, Fut>(
+        &self,
+        name: &str,
+        max_retries: u32,
+        processor: F,
+    ) -> QueueService
+    where
+        T: for<'de> Deserialize<'de> + Serialize + Clone + Send + Sync + 'static,
+        F: Fn(QueueJob<T>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), AppError>> + Send + 'static,
+    {
+        let queue_name = format!("{}_{}_queue", self.config.environment, name);
+        
+        let queue_service = QueueService {
+            queue_name: queue_name.clone(),
+            max_retries,
+            manager: self.clone(),
+        };
+
+        // Automatically start processing (non-blocking)
+        queue_service.start_processing::<T, F, Fut>(processor);
+
+        queue_service
     }
 
     /// Create a connection with timeout
@@ -217,8 +241,28 @@ impl QueueService {
         }
     }
 
-    /// Process queue with handler
-    pub async fn handle_process_queue<T, F, Fut>(&self, handler: F) -> Result<(), AppError>
+    /// Start processing queue with handler (spawns background worker automatically)
+    pub fn start_processing<T, F, Fut>(&self, handler: F)
+    where
+        T: for<'de> Deserialize<'de> + Serialize + Clone + Send + Sync + 'static,
+        F: Fn(QueueJob<T>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), AppError>> + Send + 'static,
+    {
+        self.spawn_worker(handler);
+    }
+
+    /// Alias for start_processing (for backward compatibility)
+    pub fn attach_processor<T, F, Fut>(&self, handler: F)
+    where
+        T: for<'de> Deserialize<'de> + Serialize + Clone + Send + Sync + 'static,
+        F: Fn(QueueJob<T>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), AppError>> + Send + 'static,
+    {
+        self.start_processing(handler);
+    }
+
+    /// Internal method to spawn background worker
+    fn spawn_worker<T, F, Fut>(&self, handler: F)
     where
         T: for<'de> Deserialize<'de> + Serialize + Clone + Send + Sync + 'static,
         F: Fn(QueueJob<T>) -> Fut + Send + Sync + 'static,
@@ -304,8 +348,6 @@ impl QueueService {
                 }
             }
         });
-
-        Ok(())
     }
 
     async fn handle_success<T>(

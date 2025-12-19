@@ -1,19 +1,26 @@
-use sqlx::PgPool;
+use tracing::warn;
 
+use crate::config::AppState;
 use crate::dto::{CreateUserRequest, LoginRequest, LoginResponse, RegisterResponse, UpdateUserRequest, UserResponse};
 use crate::interceptors::AppError;
 use crate::middleware::{Claims, generate_token};
 use crate::models::User;
+use crate::services::EmailService;
 use crate::utils::{hash_password, validate_request, verify_password};
 
 #[derive(Clone)]
 pub struct UserService {
-    pool: PgPool,
+    state: AppState,
+    email_service: Option<EmailService>,
 }
 
 impl UserService {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(state: AppState) -> Self {
+        Self { state, email_service: None }
+    }
+
+    pub fn new_with_email(state: AppState, email_service: EmailService) -> Self {
+        Self { state, email_service: Some(email_service) }
     }
 
     /// Register a new user
@@ -24,7 +31,7 @@ impl UserService {
         // Check if user already exists
         let existing_user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
             .bind(&request.email)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.state.db)
             .await?;
 
         if existing_user.is_some() {
@@ -50,12 +57,27 @@ impl UserService {
         .bind(user.is_active)
         .bind(user.created_at)
         .bind(user.updated_at)
-        .fetch_one(&self.pool)
+        .fetch_one(&self.state.db)
         .await?;
+
+        let user_response = inserted_user.to_response();
+
+        // Send welcome email via queue (non-blocking)
+        if let Some(email_service) = &self.email_service {
+            match email_service.send_welcome_email(&user_response).await {
+                Ok(job_id) => {
+                    tracing::info!("📧 Welcome email job {} queued for user {}", job_id, user_response.id);
+                }
+                Err(e) => {
+                    warn!("⚠️  Failed to queue welcome email for user {}: {}", user_response.id, e);
+                    // Don't fail registration if email queueing fails
+                }
+            }
+        }
 
         // Return user data only (no token for registration)
         Ok(RegisterResponse {
-            user: inserted_user.to_response(),
+            user: user_response,
         })
     }
 
@@ -67,7 +89,7 @@ impl UserService {
         // Find user by email
         let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
             .bind(&request.email)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.state.db)
             .await?
             .ok_or_else(|| AppError::Unauthorized("Invalid email or password".to_string()))?;
 
@@ -97,7 +119,7 @@ impl UserService {
     pub async fn get_user_by_id(&self, user_id: &str) -> Result<UserResponse, AppError> {
         let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
             .bind(user_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.state.db)
             .await?
             .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
@@ -119,7 +141,7 @@ impl UserService {
             let existing = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1 AND id != $2")
                 .bind(email)
                 .bind(user_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.state.db)
                 .await?;
 
             if existing.is_some() {
@@ -154,7 +176,7 @@ impl UserService {
 
         query_builder = query_builder.bind(user_id);
 
-        let updated_user = query_builder.fetch_one(&self.pool).await?;
+        let updated_user = query_builder.fetch_one(&self.state.db).await?;
 
         Ok(updated_user.to_response())
     }
@@ -163,7 +185,7 @@ impl UserService {
     pub async fn delete_user(&self, user_id: &str) -> Result<(), AppError> {
         let result = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&self.state.db)
             .await?;
 
         if result.rows_affected() == 0 {
