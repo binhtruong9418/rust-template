@@ -1,216 +1,305 @@
-use async_trait::async_trait;
-use deadpool_redis::{Connection, Pool};
-use deadpool_redis::redis::AsyncCommands;
+use anyhow::{Context, Result};
+use once_cell::sync::OnceCell;
+use redis::{aio::ConnectionManager, AsyncCommands};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
+use uuid::Uuid;
 
-use crate::config::RedisConfig;
 use crate::interceptors::AppError;
-use super::job::{Job, JobId, JobStatus, JobResult};
 
-type JobHandler<T, R> = Arc<dyn Fn(Job<T>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<R, AppError>> + Send>> + Send + Sync>;
+// Global queue manager
+static QUEUE_MANAGER: OnceCell<QueueManager> = OnceCell::new();
 
-/// Queue Service - similar to BeeQueue in Node.js
-pub struct QueueService<T, R>
+/// Job structure for queue
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueJob<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
-    R: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    T: Clone,
 {
-    queue_name: String,
-    redis_pool: Pool,
-    max_retries: u32,
-    is_worker: bool,
-    remove_on_success: bool,
-    remove_on_failure: bool,
-    delayed_debounce: u64,
-    processing: Arc<RwLock<bool>>,
-    _phantom_t: std::marker::PhantomData<T>,
-    _phantom_r: std::marker::PhantomData<R>,
+    pub id: String,
+    pub data: T,
+    pub attempts: u32,
+    pub max_retries: u32,
+    pub timeout_ms: u64,
+    pub backoff_ms: u64,
+    pub created_at: i64,
 }
 
-impl<T, R> QueueService<T, R>
+impl<T> QueueJob<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
-    R: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    T: Serialize + Clone,
 {
-    /// Create a new QueueService instance
-    pub async fn new(name: &str, retries: u32) -> Result<Self, AppError> {
-        dotenv::dotenv().ok();
+    pub fn new(data: T, max_retries: u32, timeout_ms: u64) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            data,
+            attempts: 0,
+            max_retries,
+            timeout_ms,
+            backoff_ms: 2000, // 2 seconds base
+            created_at: chrono::Utc::now().timestamp(),
+        }
+    }
+}
 
-        let environment = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
-        let queue_name = format!("rust_template_{}_queue_{}", name, environment);
+/// Queue configuration
+#[derive(Debug, Clone)]
+pub struct QueueConfig {
+    pub redis_url: String,
+    pub environment: String,
+    pub remove_on_success: bool,
+    pub remove_on_failure: bool,
+}
 
-        // Create Redis pool
-        let redis_config = RedisConfig::from_env()
-            .map_err(|e| AppError::RedisError(format!("Failed to load Redis config: {}", e)))?;
-
-        let redis_pool = redis_config.create_pool()
-            .map_err(|e| AppError::RedisError(format!("Failed to create Redis pool: {}", e)))?;
-
-        let service = Self {
-            queue_name,
-            redis_pool,
-            max_retries: retries,
-            is_worker: true,
+impl QueueConfig {
+    pub fn new(redis_url: String, environment: String) -> Self {
+        Self {
+            redis_url,
+            environment,
             remove_on_success: true,
             remove_on_failure: false,
-            delayed_debounce: 1000, // 1 second
-            processing: Arc::new(RwLock::new(false)),
-            _phantom_t: std::marker::PhantomData,
-            _phantom_r: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Queue statistics
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QueueStats {
+    pub waiting: usize,
+    pub processing: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+}
+
+/// Global Queue Manager
+#[derive(Clone)]
+pub struct QueueManager {
+    config: Arc<QueueConfig>,
+    client: redis::Client,
+}
+
+impl QueueManager {
+    /// Initialize global queue manager
+    pub fn init(config: QueueConfig) -> Result<(), AppError> {
+        let client = redis::Client::open(config.redis_url.as_str())
+            .map_err(|e| AppError::RedisError(format!("Failed to create Redis client: {}", e)))?;
+
+        let manager = QueueManager {
+            config: Arc::new(config),
+            client,
         };
 
-        service.initialize().await?;
+        QUEUE_MANAGER
+            .set(manager)
+            .map_err(|_| AppError::RedisError("Queue manager already initialized".to_string()))?;
 
-        Ok(service)
-    }
-
-    /// Initialize the queue
-    async fn initialize(&self) -> Result<(), AppError> {
-        // Test Redis connection
-        let mut conn = self.get_connection().await?;
-        let _: String = redis::cmd("PING")
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| AppError::RedisError(format!("Redis connection failed: {}", e)))?;
-
-        tracing::info!("Queue '{}' initialized successfully", self.queue_name);
+        tracing::info!("✅ Queue manager initialized");
         Ok(())
     }
 
-    /// Add a job to the queue
-    pub async fn add_to_queue(&self, data: T) -> Result<Job<T>, AppError> {
-        let job = Job::new(data, self.max_retries)
-            .with_id(chrono::Utc::now().timestamp_millis().to_string())
-            .with_timeout(60000)
-            .with_backoff_delay(2000);
+    /// Get global instance
+    pub fn global() -> &'static QueueManager {
+        QUEUE_MANAGER
+            .get()
+            .expect("Queue manager not initialized. Call QueueManager::init() first")
+    }
 
-        let mut conn = self.get_connection().await?;
+    /// Create a queue service instance
+    pub fn create_queue(&self, name: &str, max_retries: u32) -> QueueService {
+        let queue_name = format!("{}_{}_queue", self.config.environment, name);
 
-        // Serialize job
+        QueueService {
+            queue_name,
+            max_retries,
+            manager: self.clone(),
+        }
+    }
+
+    /// Create a connection with timeout
+    async fn get_connection(&self) -> Result<ConnectionManager, AppError> {
+        let connection_future = ConnectionManager::new(self.client.clone());
+        
+        timeout(Duration::from_secs(3), connection_future)
+            .await
+            .map_err(|_| AppError::RedisError("Redis connection timeout after 3 seconds".to_string()))?
+            .map_err(|e| AppError::RedisError(format!("Failed to get Redis connection: {}", e)))
+    }
+
+    /// Health check for Redis connection
+    async fn health_check(&self) -> Result<bool, AppError> {
+        match timeout(Duration::from_secs(2), async {
+            let mut conn = ConnectionManager::new(self.client.clone()).await?;
+            let _: Option<String> = conn.get("__health_check_key__").await?;
+            Ok::<(), redis::RedisError>(())
+        }).await {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(_)) | Err(_) => Ok(false),
+        }
+    }
+
+    /// Get queue statistics with timeout
+    async fn get_stats(&self, queue_name: &str) -> Result<QueueStats, AppError> {
+        let result = timeout(Duration::from_secs(3), async {
+            let mut conn = self.get_connection().await?;
+
+            let waiting_key = format!("{}:waiting", queue_name);
+            let processing_key = format!("{}:processing", queue_name);
+            let succeeded_key = format!("{}:succeeded", queue_name);
+            let failed_key = format!("{}:failed", queue_name);
+
+            let waiting: usize = conn.llen(&waiting_key).await.unwrap_or(0);
+            let processing: usize = conn.llen(&processing_key).await.unwrap_or(0);
+            let succeeded: usize = conn.llen(&succeeded_key).await.unwrap_or(0);
+            let failed: usize = conn.llen(&failed_key).await.unwrap_or(0);
+
+            Ok::<QueueStats, AppError>(QueueStats {
+                waiting,
+                processing,
+                succeeded,
+                failed,
+            })
+        }).await;
+
+        match result {
+            Ok(stats) => stats,
+            Err(_) => Err(AppError::RedisError(format!("Timeout getting stats for queue '{}'", queue_name))),
+        }
+    }
+}
+
+/// Queue Service - Optimized BeeQueue pattern
+#[derive(Clone)]
+pub struct QueueService {
+    queue_name: String,
+    max_retries: u32,
+    manager: QueueManager,
+}
+
+impl QueueService {
+    /// Add job to queue with fast fail on Redis error
+    pub async fn add_to_queue<T>(&self, data: T) -> Result<String, AppError>
+    where
+        T: Serialize + Clone,
+    {
+        // Fast health check before attempting to add job
+        if !self.manager.health_check().await? {
+            return Err(AppError::RedisError("Redis is not available. Job cannot be added to queue.".to_string()));
+        }
+
+        let job = QueueJob::new(data, self.max_retries, 60000); // 60s timeout
+        let job_id = job.id.clone();
         let job_json = serde_json::to_string(&job)
             .map_err(|e| AppError::QueueError(format!("Failed to serialize job: {}", e)))?;
 
-        // Add to pending queue (RPUSH to maintain order)
-        let pending_key = format!("{}:pending", self.queue_name);
-        conn.rpush::<_, _, ()>(&pending_key, &job_json)
-            .await
-            .map_err(|e| AppError::RedisError(e.to_string()))?;
+        // Wrap Redis operations with timeout
+        let result = timeout(Duration::from_secs(5), async {
+            let mut conn = self.manager.get_connection().await?;
 
-        // Store job data for tracking
-        let job_key = format!("{}:job:{}", self.queue_name, job.id);
-        conn.set_ex::<_, _, ()>(&job_key, &job_json, 86400) // 24 hours expiration
-            .await
-            .map_err(|e| AppError::RedisError(e.to_string()))?;
+            // Store job data with TTL (24 hours)
+            let job_key = format!("{}:job:{}", self.queue_name, job_id);
+            conn.set_ex::<_, _, ()>(&job_key, &job_json, 86400).await?;
 
-        tracing::debug!("Job {} added to queue '{}'", job.id, self.queue_name);
+            // Push to waiting list
+            let waiting_key = format!("{}:waiting", self.queue_name);
+            conn.rpush::<_, _, ()>(&waiting_key, &job_json).await?;
 
-        Ok(job)
+            Ok::<(), AppError>(())
+        }).await;
+
+        match result {
+            Ok(Ok(_)) => {
+                tracing::debug!("Job {} added to queue '{}'", job_id, self.queue_name);
+                Ok(job_id)
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(AppError::RedisError(format!("Timeout adding job {} to queue '{}'", job_id, self.queue_name))),
+        }
     }
 
-    /// Process jobs from the queue
-    pub async fn handle_process_queue<F, Fut>(&self, handler: F) -> Result<(), AppError>
+    /// Process queue with handler
+    pub async fn handle_process_queue<T, F, Fut>(&self, handler: F) -> Result<(), AppError>
     where
-        F: Fn(Job<T>) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Result<R, AppError>> + Send + 'static,
+        T: for<'de> Deserialize<'de> + Serialize + Clone + Send + Sync + 'static,
+        F: Fn(QueueJob<T>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), AppError>> + Send + 'static,
     {
-        if !self.is_worker {
-            return Err(AppError::QueueError("Queue is not configured as worker".to_string()));
-        }
-
-        let processing = self.processing.clone();
+        let handler = Arc::new(handler);
         let queue_name = self.queue_name.clone();
-        let redis_pool = self.redis_pool.clone();
-        let remove_on_success = self.remove_on_success;
-        let remove_on_failure = self.remove_on_failure;
-        let delayed_debounce = self.delayed_debounce;
+        let manager = self.manager.clone();
+        let waiting_key = format!("{}:waiting", queue_name);
+        let processing_key = format!("{}:processing", queue_name);
 
-        // Spawn worker task
         tokio::spawn(async move {
-            tracing::info!("Worker started for queue '{}'", queue_name);
+            tracing::info!("🚀 Worker started for queue: {}", queue_name);
 
             loop {
-                // Check if already processing
-                {
-                    let is_processing = processing.read().await;
-                    if *is_processing {
-                        sleep(Duration::from_millis(100)).await;
-                        continue;
-                    }
+                // Check Redis health before attempting connection
+                if !manager.health_check().await.unwrap_or(false) {
+                    tracing::warn!("Queue {} Redis health check failed, waiting 10 seconds...", queue_name);
+                    sleep(Duration::from_secs(10)).await;
+                    continue;
                 }
 
-                // Try to get a job
-                let job_result = Self::fetch_job(&redis_pool, &queue_name).await;
+                let mut conn = match manager.get_connection().await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
 
-                match job_result {
-                    Ok(Some(mut job)) => {
-                        // Mark as processing
-                        {
-                            let mut is_processing = processing.write().await;
-                            *is_processing = true;
-                        }
+                // Move job from waiting to processing (BRPOPLPUSH with 5s timeout)
+                let result: Result<Option<String>, _> =
+                    conn.brpoplpush(&waiting_key, &processing_key, 5.0).await;
 
-                        tracing::debug!("Processing job {} from queue '{}'", job.id, queue_name);
-                        job.mark_processing();
+                match result {
+                    Ok(Some(job_json)) => {
+                        let mut job: QueueJob<T> = match serde_json::from_str(&job_json) {
+                            Ok(j) => j,
+                            Err(_) => continue,
+                        };
 
-                        // Process the job
-                        let result = handler(job.clone()).await;
+                        tracing::debug!("Processing job: {} in queue '{}'", job.id, queue_name);
+                        job.attempts += 1;
+
+                        let handler_clone = Arc::clone(&handler);
+                        let job_clone = job.clone();
+
+                        // Execute handler with timeout
+                        let timeout_duration = Duration::from_millis(job.timeout_ms);
+                        let result = tokio::time::timeout(
+                            timeout_duration,
+                            handler_clone(job_clone),
+                        )
+                        .await;
 
                         match result {
-                            Ok(res) => {
-                                job.mark_completed();
-                                tracing::info!("Job {} completed successfully", job.id);
-
-                                // Remove from queue if configured
-                                if remove_on_success {
-                                    let _ = Self::remove_job(&redis_pool, &queue_name, &job.id).await;
+                            Ok(Ok(_)) => {
+                                if let Err(e) = Self::handle_success(&manager, &queue_name, &job, &processing_key).await {
+                                    tracing::error!("Error handling success: {}", e);
                                 }
                             }
-                            Err(e) => {
-                                let error_msg = e.to_string();
-                                tracing::error!("Job {} failed: {}", job.id, error_msg);
-
-                                // Check if can retry
-                                if job.can_retry() {
-                                    job.increment_retry();
-                                    tracing::info!("Retrying job {} (attempt {}/{})", job.id, job.retries, job.max_retries);
-
-                                    // Calculate backoff delay
-                                    let backoff_delay = job.calculate_backoff();
-                                    sleep(Duration::from_millis(backoff_delay)).await;
-
-                                    // Re-add to queue
-                                    let _ = Self::requeue_job(&redis_pool, &queue_name, &job).await;
-                                } else {
-                                    job.mark_failed(error_msg);
-                                    tracing::error!("Job {} failed permanently after {} retries", job.id, job.retries);
-
-                                    // Remove from queue if configured
-                                    if remove_on_failure {
-                                        let _ = Self::remove_job(&redis_pool, &queue_name, &job.id).await;
-                                    }
+                            Ok(Err(e)) => {
+                                tracing::debug!("Job {} failed: {}", job.id, e);
+                                if let Err(err) = Self::handle_failure(&manager, &queue_name, job, &processing_key, &waiting_key).await {
+                                    tracing::error!("Error handling failure: {}", err);
+                                }
+                            }
+                            Err(_) => {
+                                tracing::debug!("Job {} timed out", job.id);
+                                if let Err(err) = Self::handle_failure(&manager, &queue_name, job, &processing_key, &waiting_key).await {
+                                    tracing::error!("Error handling timeout: {}", err);
                                 }
                             }
                         }
-
-                        // Mark as not processing
-                        {
-                            let mut is_processing = processing.write().await;
-                            *is_processing = false;
-                        }
-
-                        // Debounce delay
-                        sleep(Duration::from_millis(delayed_debounce)).await;
                     }
                     Ok(None) => {
-                        // No jobs available, wait before checking again
-                        sleep(Duration::from_millis(delayed_debounce)).await;
+                        // No job available, small sleep
+                        sleep(Duration::from_millis(100)).await;
                     }
-                    Err(e) => {
-                        tracing::error!("Error fetching job from queue '{}': {}", queue_name, e);
-                        sleep(Duration::from_millis(delayed_debounce * 2)).await;
+                    Err(_) => {
+                        sleep(Duration::from_secs(5)).await;
                     }
                 }
             }
@@ -219,139 +308,106 @@ where
         Ok(())
     }
 
-    /// Get job result (wait for completion)
-    pub async fn get_job_result(&self, job_id: &str, timeout_secs: u64) -> Result<JobResult<R>, AppError> {
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(timeout_secs);
-
-        loop {
-            if start.elapsed() > timeout {
-                return Err(AppError::QueueError(format!("Job {} timed out", job_id)));
-            }
-
-            let job_key = format!("{}:job:{}", self.queue_name, job_id);
-            let mut conn = self.get_connection().await?;
-
-            let job_data: Option<String> = conn.get(&job_key)
-                .await
-                .map_err(|e| AppError::RedisError(e.to_string()))?;
-
-            if let Some(job_json) = job_data {
-                let job: Job<T> = serde_json::from_str(&job_json)
-                    .map_err(|e| AppError::QueueError(format!("Failed to deserialize job: {}", e)))?;
-
-                match job.status {
-                    JobStatus::Completed => {
-                        // Try to get result from results key
-                        let result_key = format!("{}:result:{}", self.queue_name, job_id);
-                        let result_data: Option<String> = conn.get(&result_key)
-                            .await
-                            .map_err(|e| AppError::RedisError(e.to_string()))?;
-
-                        let result = result_data.and_then(|r| serde_json::from_str(&r).ok());
-
-                        return Ok(JobResult {
-                            job_id: job.id,
-                            status: JobStatus::Completed,
-                            result,
-                            error: None,
-                        });
-                    }
-                    JobStatus::Failed => {
-                        return Ok(JobResult {
-                            job_id: job.id,
-                            status: JobStatus::Failed,
-                            result: None,
-                            error: job.error,
-                        });
-                    }
-                    _ => {
-                        // Still processing, wait and check again
-                        sleep(Duration::from_millis(500)).await;
-                    }
-                }
-            } else {
-                return Err(AppError::QueueError(format!("Job {} not found", job_id)));
-            }
-        }
-    }
-
-    // Helper methods
-
-    async fn get_connection(&self) -> Result<Connection, AppError> {
-        self.redis_pool.get().await.map_err(|e| AppError::RedisError(e.to_string()))
-    }
-
-    async fn fetch_job(pool: &Pool, queue_name: &str) -> Result<Option<Job<T>>, AppError> {
-        let mut conn = pool.get().await.map_err(|e| AppError::RedisError(e.to_string()))?;
-
-        let pending_key = format!("{}:pending", queue_name);
-
-        // LPOP to get oldest job (FIFO)
-        let job_data: Option<String> = conn.lpop(&pending_key, None)
-            .await
-            .map_err(|e| AppError::RedisError(e.to_string()))?;
-
-        if let Some(job_json) = job_data {
-            let job: Job<T> = serde_json::from_str(&job_json)
-                .map_err(|e| AppError::QueueError(format!("Failed to deserialize job: {}", e)))?;
-
-            Ok(Some(job))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn requeue_job(pool: &Pool, queue_name: &str, job: &Job<T>) -> Result<(), AppError> {
-        let mut conn = pool.get().await.map_err(|e| AppError::RedisError(e.to_string()))?;
-
+    async fn handle_success<T>(
+        manager: &QueueManager,
+        queue_name: &str,
+        job: &QueueJob<T>,
+        processing_key: &str,
+    ) -> Result<(), AppError>
+    where
+        T: Serialize + Clone,
+    {
         let job_json = serde_json::to_string(job)
             .map_err(|e| AppError::QueueError(format!("Failed to serialize job: {}", e)))?;
+        
+        let result = timeout(Duration::from_secs(3), async {
+            let mut conn = manager.get_connection().await?;
 
-        let pending_key = format!("{}:pending", queue_name);
-        conn.rpush::<_, _, ()>(&pending_key, &job_json)
-            .await
-            .map_err(|e| AppError::RedisError(e.to_string()))?;
+            // Remove from processing
+            conn.lrem::<_, _, ()>(processing_key, 1, &job_json).await?;
 
-        // Update job data
-        let job_key = format!("{}:job:{}", queue_name, job.id);
-        conn.set_ex::<_, _, ()>(&job_key, &job_json, 86400)
-            .await
-            .map_err(|e| AppError::RedisError(e.to_string()))?;
+            if manager.config.remove_on_success {
+                // Remove job data
+                let job_key = format!("{}:job:{}", queue_name, job.id);
+                conn.del::<_, ()>(&job_key).await?;
+            } else {
+                // Move to succeeded list
+                let succeeded_key = format!("{}:succeeded", queue_name);
+                conn.lpush::<_, _, ()>(&succeeded_key, &job_json).await?;
+            }
 
-        Ok(())
-    }
+            Ok::<(), AppError>(())
+        }).await;
 
-    async fn remove_job(pool: &Pool, queue_name: &str, job_id: &str) -> Result<(), AppError> {
-        let mut conn = pool.get().await.map_err(|e| AppError::RedisError(e.to_string()))?;
-
-        let job_key = format!("{}:job:{}", queue_name, job_id);
-        conn.del::<_, ()>(&job_key)
-            .await
-            .map_err(|e| AppError::RedisError(e.to_string()))?;
-
-        Ok(())
-    }
-}
-
-// Implement Clone manually since derive doesn't work well with PhantomData
-impl<T, R> Clone for QueueService<T, R>
-where
-    T: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
-    R: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
-{
-    fn clone(&self) -> Self {
-        Self {
-            queue_name: self.queue_name.clone(),
-            redis_pool: self.redis_pool.clone(),
-            max_retries: self.max_retries,
-            is_worker: self.is_worker,
-            remove_on_success: self.remove_on_success,
-            remove_on_failure: self.remove_on_failure,
-            delayed_debounce: self.delayed_debounce,
-            processing: self.processing.clone(),
-            _phantom_t: std::marker::PhantomData,
-            _phantom_r: std::marker::PhantomData,
+        match result {
+            Ok(res) => res,
+            Err(_) => Err(AppError::RedisError(format!("Timeout handling success for job {}", job.id))),
         }
+    }
+
+    async fn handle_failure<T>(
+        manager: &QueueManager,
+        queue_name: &str,
+        job: QueueJob<T>,
+        processing_key: &str,
+        waiting_key: &str,
+    ) -> Result<(), AppError>
+    where
+        T: Serialize + Clone,
+    {
+        let job_json = serde_json::to_string(&job)
+            .map_err(|e| AppError::QueueError(format!("Failed to serialize job: {}", e)))?;
+        
+        let result = timeout(Duration::from_secs(3), async {
+            let mut conn = manager.get_connection().await?;
+
+            // Remove from processing
+            conn.lrem::<_, _, ()>(processing_key, 1, &job_json).await?;
+
+            if job.attempts < job.max_retries {
+                // Calculate exponential backoff
+                let backoff = job.backoff_ms * (2_u64.pow(job.attempts - 1));
+                tracing::debug!("Retrying job {} (attempt {}/{}) after {} ms", job.id, job.attempts, job.max_retries, backoff);
+
+                sleep(Duration::from_millis(backoff)).await;
+
+                // Re-queue job
+                let updated_job_json = serde_json::to_string(&job)?;
+                conn.lpush::<_, _, ()>(waiting_key, &updated_job_json).await?;
+            } else {
+                tracing::debug!("Job {} failed permanently after {} attempts", job.id, job.attempts);
+
+                if manager.config.remove_on_failure {
+                    // Remove job data
+                    let job_key = format!("{}:job:{}", queue_name, job.id);
+                    conn.del::<_, ()>(&job_key).await?;
+                } else {
+                    // Move to failed list
+                    let failed_key = format!("{}:failed", queue_name);
+                    conn.lpush::<_, _, ()>(&failed_key, &job_json).await?;
+                }
+            }
+
+            Ok::<(), AppError>(())
+        }).await;
+
+        match result {
+            Ok(res) => res,
+            Err(_) => Err(AppError::RedisError(format!("Timeout handling failure for job {}", job.id))),
+        }
+    }
+
+    /// Get queue stats with fast fail
+    pub async fn get_stats(&self) -> Result<QueueStats, AppError> {
+        if !self.manager.health_check().await? {
+            return Err(AppError::RedisError("Redis is not available. Cannot get queue stats.".to_string()));
+        }
+        
+        self.manager.get_stats(&self.queue_name).await
+    }
+
+    /// Get queue name
+    pub fn get_name(&self) -> &str {
+        &self.queue_name
     }
 }

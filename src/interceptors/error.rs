@@ -167,5 +167,12 @@ impl From<deadpool_redis::PoolError> for AppError {
     }
 }
 
+// Implement From for serde_json errors
+impl From<serde_json::Error> for AppError {
+    fn from(err: serde_json::Error) -> Self {
+        AppError::QueueError(format!("Serialization error: {}", err))
+    }
+}
+
 // Result type alias
 pub type AppResult<T> = Result<T, AppError>;
